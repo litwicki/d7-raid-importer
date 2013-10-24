@@ -1,0 +1,8 @@
+name = Raid Importer
+description = Import a raid from Mizus RaidTracker using <strong>EQDKP-Plus XML</strong> data.
+project = sacrifice
+package = Sacrifice (Mannoroth-US)
+
+dependencies[] = sacrifice
+
+core = "7.x"

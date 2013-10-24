@@ -1,0 +1,269 @@
+<?php
+
+/**
+ *  Copyright (c) 2012 Litwicki Media
+ *  Written for Sacrifice Guild
+ *  @author: Thezdin, thezdin@sacrificeguild.org
+ *  @version: $Id$
+ *  
+ */
+ 
+module_load_include('inc', 'sacrifice', 'inc/sacrifice.constants');
+module_load_include('inc', 'sacrifice', 'inc/sacrifice.helpers');
+module_load_include('inc', 'sacrifice', 'inc/sacrifice.core');
+module_load_include('php', 'sacrifice', 'wowhead/parse');
+
+/**
+* Implements hook_menu().
+*/
+
+function sacrifice_raid_importer_menu(){
+  $items = array();
+  $items['raid_import'] = array(
+    'title' => 'Sacrifice Raid Import',
+    'description' => 'Import a raid from Mizus RaidTracker using EQDKP-Plus XML formatted data.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('sacrifice_raid_importer_import_form'),
+    'access arguments' => array('administer content'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  return $items;
+}
+
+function sacrifice_raid_importer_import_form() {
+  $form = array();
+
+  $form['sacrifice_raid_title'] = array(
+    '#type' => 'textfield',
+    '#title' => 'Raid Title',
+    '#required' => TRUE,
+    '#default_value' => t('Siege of Orgrimmar'),
+    '#description' => t('The title or label for this raid.'),
+  );
+
+  $form['sacrifice_raid_body'] = array(
+    '#type' => 'textfield',
+    '#title' => 'Raid Description',
+    '#required' => TRUE,
+    '#default_value' => t('Siege of Orgrimmar - ' . date('m/d/Y', time())),
+    '#description' => t('The description (body) of the raid.'),
+  );
+
+  $form['include_loot'] = array(
+    '#type' => 'radios',
+    '#title' => t('Include loot?'),
+    '#options' => array(0 => 'No', 1 => 'Yes'),
+    '#default_value' => 1,
+  );
+
+  $form['sacrifice_raid_xml_data'] = array(
+    '#type' => 'textarea',
+    '#title' => 'Raid XML Data',
+    '#required' => TRUE,
+    '#description' => t('The raw XML export from Mizus RaidTracker (EQDKP-Plus XML format)'),
+  );
+
+  $form['debug'] = array(
+    '#type' => 'radios',
+    '#title' => t('Debug mode?'),
+    '#options' => array(0 => 'No', 1 => 'Yes'),
+    '#default_value' => 0,
+  );
+
+  $form['sacrifice_raid_import_submit'] = array(
+    '#type' => 'submit',
+    '#value' => 'Import Raid',
+  );
+  return $form;
+}
+
+function sacrifice_raid_importer_import_form_validate($form, &$form_state){
+  return true;
+}
+
+function sacrifice_raid_importer_import_form_submit($form, &$form_state){
+  global $user;
+  
+  $messages = array();
+  $warnings = array();
+
+  $data = $form_state['values']['sacrifice_raid_xml_data'];
+
+  $xml = simplexml_load_string($data);
+  $json = json_encode($xml);
+  $feed = json_decode($json, TRUE);
+
+  // $xml = _sacrifice_xml_parse($data);
+  // $feed = _xml_to_array($xml);
+
+  //first create the raid node
+  $member_data = $feed['PlayerInfos'];
+  $loot_data = $feed['Loot'];
+
+  $raid = new stdClass();
+  $raid->title = $form_state['values']['sacrifice_raid_title'];
+  $raid->field_description = sacrifice_set_field_val($form_state['values']['sacrifice_raid_body'], 'value');
+  $raid->type = 'raid';
+  $raid->language = LANGUAGE_NONE;
+  $raid->uid = $user->uid;
+  $raid->status = 1;
+  $raid->promote = 0;
+  $raid->field_import_data = sacrifice_set_field_val($form_state['values']['sacrifice_raid_xml_data'], 'value');
+  //$raid->comment = 2;
+
+  /**
+   *  Use UNIX timestamps for date fields because our _set_field_val functions
+   *  will convert to properly formatted date values, assuming UNIX values
+   */
+  $raid_date = strtotime($feed['start']);
+  $raid_date_full = array(
+    'start' => $raid_date,
+    'end' => strtotime($feed['end']),
+  );
+
+  $raid->field_raid_date = sacrifice_set_field_val($raid_date, 'date');
+  $raid->field_raid_date_full = sacrifice_set_field_val($raid_date_full, 'date');
+
+  /**
+   *  Loop through characters in attendance and build a user reference array
+   *  and an avatar reference array for the raid node. This way we can
+   *  fall back on raid attendance and track it per user, and by which
+   *  character that user played for this raid. 
+   */
+  
+  $missing = array();
+  $attendance = array();
+  $avatars = array();
+  $i = 0;
+  $n = 0;
+  
+  foreach($member_data as $key => $member){
+    $raiduser = sacrifice_user_by_avatar_name($member['name']);
+    //you cannot have an avatar without being a raiduser, so check that first
+    if($raiduser){
+      //sacrifice_debug_print($raiduser);
+      $attendance[$i] = $raiduser->uid;
+      $i++;
+      $avatar = sacrifice_user_avatar_by_name($member['name']);
+      if($avatar){
+        //sacrifice_debug_print($avatar);
+        $avatars[$n] = $avatar->aid;
+        $n++;
+      }
+    }
+    else {
+      //maybe they're a raiduser, but they don't have a character claimed by the same name?
+      $raiduser = sacrifice_user_by_username($member['name']);
+      if($raiduser){
+        $attendance[$i] = $raiduser->uid;
+        $i++;
+      }
+      else {
+        //this character isn't claimed by anyone, so we can't give attendance to it
+        //but let's keep track of this so we can annoy them to sign up on the website!
+        $warnings[] = 'Could not find user with username: ' . $member['name'];
+      }
+    }
+  }
+  
+  $messages[] = 'Added ' . count($attendance) . ' users to raid';
+  $messages[] = 'Added ' . count($avatars) . ' avatars to raid';
+  
+  //sacrifice_debug_print('Missing Users: ' . implode(', ', $missing));
+  $user_attendance = sacrifice_set_field_val($attendance, 'user');
+  $avatar_attendance = sacrifice_set_field_val($avatars, 'avatar');
+  //sacrifice_debug_print($user_attendance);
+  //sacrifice_debug_print($avatar_attendance);
+  
+  $raid->field_raid_attendance = $user_attendance;
+  $raid->field_raid_characters = $avatar_attendance;
+  
+  node_object_prepare($raid);
+  //sacrifice_debug_print($raid);
+  node_save($raid);
+  
+  /**
+   *  Loop through item data to build item references
+   */
+  if($raid->nid && $form_state['values']['include_loot']){
+    $item_count = 0;
+    foreach($loot_data as $key => $item){
+      $itemuser = sacrifice_user_by_avatar_name($item['Player']);
+      if($itemuser){
+        $uid = (int) $itemuser->uid;
+        $avatar = sacrifice_user_avatar_by_name($item['Player']);
+        if(isset($avatar->aid)) {
+          $aid = (int) $avatar->aid;
+          $boss = sacrifice_get_term_by_name($item['Boss'], SACRIFICE_RAID_BOSS_VOCABULARY);
+          $kills[] = $item['Boss'];
+          //sacrifice_debug_print($boss);
+
+          $item_id = sacrifice_parse_itemid($item['ItemID']);
+
+          //Filter out garbage items
+          $item_url = 'http://en.wowhead.com/?item=' . $item_id . '&xml';
+          $xml = new SimpleXMLElement($item_url, NULL, TRUE);
+          $xml = _xml_to_array($xml);
+
+          //only count epic/legendary items
+          if($xml['wowhead']['item']['value']['quality']['attributes']['id'] > 3) {
+            $loot_array = array(
+              'item_name' => $item['ItemName'],
+              //'boss_tid' => $boss->tid,
+              'item_id' => $item_id,
+              'aid' => $aid,
+              'uid' => $uid,
+              'raid_id' => (int) $raid->nid,
+            );
+            if(sacrifice_add_item($loot_array)){
+              $item_count++;
+            }
+          }
+
+          unset($xml);
+
+        }
+        else {
+          $warnings[] = 'Could not fetch avatar for (' . $item['Player'] . ')';
+        }
+      }
+      else{
+        $warnings[] = 'Error matching item ' . sacrifice_parse_itemid($item['ItemID'], TRUE) . ' to user "' . $item['Player'] . '" -- user avatar not found!';
+      }
+    }
+    $messages[] = 'Added ' . $item_count . ' items to raid';
+  }
+  else {
+    drupal_set_message(t('Cannot add item nodes without a raid id!'), 'error');
+  }
+  
+  foreach($warnings as $warning){
+    drupal_set_message(t($warning), 'warning');
+  }
+  foreach($messages as $message){
+    drupal_set_message(t($message));
+  }
+
+  $uri = entity_uri('node', $raid);
+  drupal_goto($uri['path']);
+
+  //$kills = array_unique($kills);
+
+  //update the raid description
+  // $raid = node_load($raid->nid);
+  // $raid_description = $item_count . ' items looted - ' . implode(', ', $kills);
+  // $raid->field_description = sacrifice_set_field_val($raid_description, 'value');
+  // node_save($raid);
+
+}
+
+function sacrifice_parse_itemid($string, $print = FALSE) {
+  $item_id = preg_replace('/(.*?):.*/', '$1', $string);
+  if($print) {
+    $string = '[item]' . $item_id . '[/item]';
+    return sacrifice_wowhead_filter_process($string);
+  }
+  else {
+    return (int) $item_id;
+  }
+}
